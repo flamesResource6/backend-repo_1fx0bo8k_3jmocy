@@ -24,6 +24,15 @@ class User(BaseModel):
     health_notes: Optional[str] = None
     loyalty_points: int = 0
     role: str = Field("user", description="user | doctor | admin")
+    # Email verification fields
+    is_verified: bool = False
+    verification_code: Optional[str] = None
+    verification_expires: Optional[datetime] = None
+    # Abuse protection / UX
+    verification_attempts: int = 0
+    last_verification_attempt_at: Optional[datetime] = None
+    last_verification_sent_at: Optional[datetime] = None
+    verification_locked_until: Optional[datetime] = None
 
 
 class Doctor(BaseModel):

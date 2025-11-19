@@ -9,6 +9,8 @@ from pydantic import BaseModel, EmailStr
 import jwt
 from passlib.context import CryptContext
 from bson.objectid import ObjectId
+import smtplib
+from email.message import EmailMessage
 
 from database import db, create_document, get_documents
 from schemas import (
@@ -23,7 +25,7 @@ from schemas import (
 )
 
 # App setup
-app = FastAPI(title="DermaCare+ API", version="0.3.1")
+app = FastAPI(title="DermaCare+ API", version="0.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +40,19 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "43200"))  # 30 days
+
+# Email (SMTP)
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER or "no-reply@dermacare.local")
+ENV_NAME = os.getenv("ENV", "development")
+
+# Verification limits
+VERIFY_MAX_ATTEMPTS = int(os.getenv("VERIFY_MAX_ATTEMPTS", "5"))
+VERIFY_LOCK_MINUTES = int(os.getenv("VERIFY_LOCK_MINUTES", "15"))
+VERIFY_RESEND_COOLDOWN_SECONDS = int(os.getenv("VERIFY_RESEND_COOLDOWN_SECONDS", "60"))
 
 # Payments (Stripe)
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET")
@@ -82,12 +97,58 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+def _send_email(to_email: str, subject: str, body_text: str, body_html: Optional[str] = None) -> bool:
+    """Send an email via SMTP. Returns True on success, False otherwise. In development with no SMTP env, logs to console."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        # Dev fallback: log email so flows are testable
+        print("\n=== EMAIL (DEV MODE) ===")
+        print(f"To: {to_email}")
+        print(f"Subject: {subject}")
+        print(body_text)
+        if body_html:
+            print("-- HTML --\n" + body_html)
+        print("=== END EMAIL ===\n")
+        return True
+    try:
+        msg = EmailMessage()
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body_text)
+        if body_html:
+            msg.add_alternative(body_html, subtype="html")
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Email send error: {e}")
+        return False
+
+
 # Models for requests
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     name: Optional[str] = None
     phone: Optional[str] = None
+
+
+class RegisterResponse(BaseModel):
+    status: str
+    message: str
+    next_step: str
+    email: EmailStr
+
+
+class VerifyStartRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyConfirmRequest(BaseModel):
+    email: EmailStr
+    code: str
 
 
 class LoginRequest(BaseModel):
@@ -164,18 +225,179 @@ def test_database():
 
 
 # Auth
-@app.post("/auth/register", response_model=TokenResponse)
+@app.post("/auth/register", response_model=RegisterResponse)
 def register(payload: RegisterRequest):
-    if db["user"].find_one({"email": payload.email}):
+    existing = db["user"].find_one({"email": payload.email})
+    if existing and existing.get("is_verified"):
         raise HTTPException(status_code=400, detail="Email already registered")
-    user = UserSchema(
+
+    code = f"{int(datetime.now().timestamp()) % 1000000:06d}"  # 6-digit code
+    expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+    now = datetime.now(timezone.utc)
+
+    if existing:
+        # Update existing unverified user
+        db["user"].update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "password_hash": pwd_context.hash(payload.password),
+                "name": payload.name,
+                "phone": payload.phone,
+                "verification_code": code,
+                "verification_expires": expires,
+                "is_verified": False,
+                "verification_attempts": 0,
+                "verification_locked_until": None,
+                "last_verification_sent_at": now,
+                "updated_at": now
+            }}
+        )
+    else:
+        user = UserSchema(
+            email=payload.email,
+            password_hash=pwd_context.hash(payload.password),
+            name=payload.name,
+            phone=payload.phone,
+            is_verified=False,
+            verification_code=code,
+            verification_expires=expires,
+            verification_attempts=0,
+            last_verification_sent_at=now,
+        )
+        create_document("user", user)
+
+    subject = "Your DermaCare+ verification code"
+    text = f"Your verification code is: {code}. It expires in 15 minutes."
+    html = f"""
+    <div style='font-family:Inter,Segoe UI,Arial,sans-serif'>
+      <h2>Verify your email</h2>
+      <p>Your verification code is:</p>
+      <p style='font-size:24px;font-weight:700;letter-spacing:3px'>{code}</p>
+      <p>This code expires in 15 minutes.</p>
+    </div>
+    """
+    _send_email(payload.email, subject, text, html)
+
+    # In development, expose hint to help testers
+    hint = " (code sent to email)"
+    if ENV_NAME.startswith("dev") or ENV_NAME.startswith("local"):
+        hint = f" (dev hint: {code})"
+
+    return RegisterResponse(
+        status="pending_verification",
+        message="We sent a 6‑digit code to your email." + hint,
+        next_step="verify_code",
         email=payload.email,
-        password_hash=pwd_context.hash(payload.password),
-        name=payload.name,
-        phone=payload.phone,
     )
-    create_document("user", user)
-    token = create_token(payload.email, role="user")
+
+
+@app.post("/auth/verify/start")
+def verify_start(payload: VerifyStartRequest):
+    user = db["user"].find_one({"email": payload.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if user.get("is_verified"):
+        return {"status": "already_verified"}
+
+    now = datetime.now(timezone.utc)
+    last_sent = user.get("last_verification_sent_at")
+    if isinstance(last_sent, str):
+        try:
+            last_sent = datetime.fromisoformat(last_sent)
+        except Exception:
+            last_sent = None
+    if last_sent and last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=timezone.utc)
+
+    if last_sent and (now - last_sent).total_seconds() < VERIFY_RESEND_COOLDOWN_SECONDS:
+        remaining = int(VERIFY_RESEND_COOLDOWN_SECONDS - (now - last_sent).total_seconds())
+        raise HTTPException(status_code=429, detail=f"Please wait {remaining}s before requesting another code")
+
+    code = f"{int(datetime.now().timestamp()) % 1000000:06d}"
+    expires = now + timedelta(minutes=15)
+    db["user"].update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "verification_code": code,
+            "verification_expires": expires,
+            "last_verification_sent_at": now,
+            "updated_at": now
+        }}
+    )
+    subject = "Your DermaCare+ verification code"
+    text = f"Your verification code is: {code}. It expires in 15 minutes."
+    html = f"<p>Your code: <b>{code}</b></p>"
+    _send_email(payload.email, subject, text, html)
+    return {"status": "sent"}
+
+
+@app.post("/auth/verify/confirm", response_model=TokenResponse)
+def verify_confirm(payload: VerifyConfirmRequest):
+    user = db["user"].find_one({"email": payload.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if user.get("is_verified"):
+        # Issue token directly
+        token = create_token(payload.email, role=user.get("role", "user"))
+        return TokenResponse(access_token=token)
+
+    # Lock check
+    now = datetime.now(timezone.utc)
+    locked_until = user.get("verification_locked_until")
+    if isinstance(locked_until, str):
+        try:
+            locked_until = datetime.fromisoformat(locked_until)
+        except Exception:
+            locked_until = None
+    if locked_until and locked_until.tzinfo is None:
+        locked_until = locked_until.replace(tzinfo=timezone.utc)
+    if locked_until and now < locked_until:
+        seconds = int((locked_until - now).total_seconds())
+        raise HTTPException(status_code=429, detail=f"Too many attempts. Try again in {seconds}s")
+
+    code = user.get("verification_code")
+    exp = user.get("verification_expires")
+    if not code or not exp:
+        raise HTTPException(status_code=400, detail="No verification in progress")
+
+    if isinstance(exp, str):
+        try:
+            exp = datetime.fromisoformat(exp)
+        except Exception:
+            pass
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+
+    if now > exp:
+        # Expired; reset attempts to allow resend flow
+        db["user"].update_one({"_id": user["_id"]}, {"$set": {"verification_attempts": 0}})
+        raise HTTPException(status_code=400, detail="Code expired")
+
+    if payload.code != code:
+        attempts = int(user.get("verification_attempts") or 0) + 1
+        updates = {"verification_attempts": attempts, "last_verification_attempt_at": now}
+        # Lock if exceeded
+        if attempts >= VERIFY_MAX_ATTEMPTS:
+            updates["verification_locked_until"] = now + timedelta(minutes=VERIFY_LOCK_MINUTES)
+            updates["verification_attempts"] = 0
+        db["user"].update_one({"_id": user["_id"]}, {"$set": updates})
+        remaining = max(0, VERIFY_MAX_ATTEMPTS - int(user.get("verification_attempts") or 0) - 1)
+        raise HTTPException(status_code=400, detail=f"Invalid code. Attempts left: {remaining}")
+
+    # Success
+    db["user"].update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "is_verified": True,
+            "verification_code": None,
+            "verification_expires": None,
+            "verification_attempts": 0,
+            "verification_locked_until": None,
+            "updated_at": now
+        }}
+    )
+
+    token = create_token(payload.email, role=user.get("role", "user"))
     return TokenResponse(access_token=token)
 
 
@@ -185,6 +407,8 @@ def login(payload: LoginRequest):
     user = db["user"].find_one({"email": payload.email})
     if not user or not pwd_context.verify(payload.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.get("is_verified"):
+        raise HTTPException(status_code=403, detail="Email not verified")
     token = create_token(payload.email, role=user.get("role", "user"))
     return TokenResponse(access_token=token)
 
