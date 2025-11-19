@@ -25,7 +25,7 @@ from schemas import (
 )
 
 # App setup
-app = FastAPI(title="DermaCare+ API", version="0.4.1")
+app = FastAPI(title="DermaCare+ API", version="0.4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -194,6 +194,11 @@ class NotificationTokenCreate(BaseModel):
     token: str
     locale: Optional[str] = None
     tz: Optional[str] = None
+
+
+class AdminBootstrapRequest(BaseModel):
+    email: EmailStr
+    token: str
 
 
 # Routes
@@ -441,7 +446,7 @@ def save_notification_token(payload: NotificationTokenCreate, current=Depends(ge
 def list_services():
     items = get_documents("service")
     for it in items:
-        it["_id"] = str(it["_id"])
+        it["_id"] = str(it["_id"]) 
     return items
 
 
@@ -494,7 +499,7 @@ def delete_service(service_id: str, current=Depends(get_current_user)):
 def list_doctors():
     items = get_documents("doctor")
     for it in items:
-        it["_id"] = str(it["_id"])
+        it["_id"] = str(it["_id"]) 
     return items
 
 
@@ -513,7 +518,7 @@ def create_doctor(doctor: DoctorSchema, current=Depends(get_current_user)):
 def list_offers():
     items = get_documents("offer")
     for it in items:
-        it["_id"] = str(it["_id"])
+        it["_id"] = str(it["_id"]) 
     return items
 
 
@@ -548,7 +553,7 @@ def create_appointment(payload: AppointmentCreate, current=Depends(get_current_u
 def my_appointments(current=Depends(get_current_user)):
     items = get_documents("appointment", {"user_id": str(current["_id"])})
     for it in items:
-        it["_id"] = str(it["_id"])
+        it["_id"] = str(it["_id"]) 
     return items
 
 
@@ -559,7 +564,7 @@ def list_appointments(current=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Not authorized")
     items = get_documents("appointment")
     for it in items:
-        it["_id"] = str(it["_id"])
+        it["_id"] = str(it["_id"]) 
     return items
 
 
@@ -587,7 +592,7 @@ def get_thread(user_id: str, doctor_id: str, current=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Forbidden")
     items = get_documents("message", {"user_id": user_id, "doctor_id": doctor_id})
     for it in items:
-        it["_id"] = str(it["_id"])
+        it["_id"] = str(it["_id"]) 
     return sorted(items, key=lambda x: x.get("created_at", datetime.now()))
 
 
@@ -631,6 +636,7 @@ def init_payment(payload: PaymentInit, current=Depends(get_current_user)):
     pid = create_document("payment", payment)
 
     client_secret = "test_client_secret"
+    reference = payment.reference
     if stripe and STRIPE_SECRET_KEY:
         try:
             intent = stripe.PaymentIntent.create(
@@ -644,9 +650,33 @@ def init_payment(payload: PaymentInit, current=Depends(get_current_user)):
                 automatic_payment_methods={"enabled": True},
             )
             client_secret = intent.get("client_secret")
+            reference = intent.get("id") or reference
         except Exception:
             client_secret = "test_client_secret"
+    # Update payment with provider reference
+    try:
+        db["payment"].update_one({"_id": ObjectId(pid)}, {"$set": {"reference": reference, "updated_at": datetime.now(timezone.utc)}})
+    except Exception:
+        pass
     return {"id": pid, "status": "initiated", "client_secret": client_secret}
+
+
+# Payment retrieval for client
+@app.get("/payments/{payment_id}")
+
+def get_payment(payment_id: str, current=Depends(get_current_user)):
+    try:
+        oid = ObjectId(payment_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id")
+    pay = db["payment"].find_one({"_id": oid})
+    if not pay:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Only owner or staff can view
+    if current.get("role") == "user" and pay.get("user_id") != str(current["_id"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    pay["_id"] = str(pay["_id"]) 
+    return pay
 
 
 # Webhook endpoint (Stripe)
@@ -687,15 +717,21 @@ async def stripe_webhook(request: Request):
         data = getattr(event, "data", None)
         data_obj = getattr(data, "object", {}) if data else {}
 
-    payment_id = None
     metadata = data_obj.get("metadata") or {}
     payment_id = metadata.get("payment_id")
+    appointment_id = metadata.get("appointment_id")
 
     if event_type in ("payment_intent.succeeded", "charge.succeeded") and payment_id:
         try:
             db["payment"].update_one({"_id": ObjectId(payment_id)}, {"$set": {"status": "succeeded", "updated_at": datetime.now(timezone.utc)}})
         except Exception:
             pass
+        # Also mark appointment as paid
+        if appointment_id:
+            try:
+                db["appointment"].update_one({"_id": ObjectId(appointment_id)}, {"$set": {"payment_status": "paid", "updated_at": datetime.now(timezone.utc)}})
+            except Exception:
+                pass
     elif event_type in ("payment_intent.payment_failed", "charge.failed") and payment_id:
         try:
             db["payment"].update_one({"_id": ObjectId(payment_id)}, {"$set": {"status": "failed", "updated_at": datetime.now(timezone.utc)}})
@@ -703,6 +739,20 @@ async def stripe_webhook(request: Request):
             pass
 
     return {"received": True}
+
+
+# Admin bootstrap: elevate a user to admin using a one-time token from env
+@app.post("/admin/bootstrap")
+
+def admin_bootstrap(payload: AdminBootstrapRequest):
+    expected = os.getenv("ADMIN_BOOTSTRAP_TOKEN")
+    if not expected or payload.token != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    user = db["user"].find_one({"email": payload.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db["user"].update_one({"_id": user["_id"]}, {"$set": {"role": "admin", "is_verified": True, "updated_at": datetime.now(timezone.utc)}})
+    return {"status": "ok", "email": payload.email, "role": "admin"}
 
 
 if __name__ == "__main__":
