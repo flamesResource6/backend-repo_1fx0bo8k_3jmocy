@@ -85,3 +85,11 @@ class Payment(BaseModel):
     provider: str = Field("stripe", description="stripe | apple_pay | google_pay | wallet")
     status: str = Field("initiated", description="initiated | succeeded | failed | refunded")
     reference: Optional[str] = None
+
+
+class NotificationToken(BaseModel):
+    user_id: str
+    platform: str = Field(..., description="ios | android | web")
+    token: str
+    locale: Optional[str] = None
+    tz: Optional[str] = None

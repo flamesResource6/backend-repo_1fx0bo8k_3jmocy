@@ -2,18 +2,28 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Depends, Body
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 import jwt
 from passlib.context import CryptContext
+from bson.objectid import ObjectId
 
 from database import db, create_document, get_documents
-from schemas import User as UserSchema, Service as ServiceSchema, Doctor as DoctorSchema, Appointment as AppointmentSchema, Message as MessageSchema, Offer as OfferSchema, Payment as PaymentSchema
+from schemas import (
+    User as UserSchema,
+    Service as ServiceSchema,
+    Doctor as DoctorSchema,
+    Appointment as AppointmentSchema,
+    Message as MessageSchema,
+    Offer as OfferSchema,
+    Payment as PaymentSchema,
+    NotificationToken as NotificationTokenSchema,
+)
 
 # App setup
-app = FastAPI(title="DermaCare+ API", version="0.1.0")
+app = FastAPI(title="DermaCare+ API", version="0.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +87,15 @@ class ServiceCreate(ServiceSchema):
     pass
 
 
+class ServiceUpdate(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    price: Optional[float] = None
+    featured: Optional[bool] = None
+
+
 class AppointmentCreate(BaseModel):
     service_id: str
     date: str  # YYYY-MM-DD
@@ -95,6 +114,13 @@ class MessageCreate(BaseModel):
     text: Optional[str] = None
     image_url: Optional[str] = None
     audio_url: Optional[str] = None
+
+
+class NotificationTokenCreate(BaseModel):
+    platform: str
+    token: str
+    locale: Optional[str] = None
+    tz: Optional[str] = None
 
 
 # Routes
@@ -156,6 +182,20 @@ def me(current=Depends(get_current_user)):
     return current
 
 
+# Notification tokens
+@app.post("/notifications/token")
+def save_notification_token(payload: NotificationTokenCreate, current=Depends(get_current_user)):
+    doc = NotificationTokenSchema(
+        user_id=str(current["_id"]),
+        platform=payload.platform,
+        token=payload.token,
+        locale=payload.locale,
+        tz=payload.tz,
+    )
+    nid = create_document("notificationtoken", doc)
+    return {"id": nid}
+
+
 # Services
 @app.get("/services")
 def list_services():
@@ -171,6 +211,38 @@ def create_service(service: ServiceCreate, current=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Not authorized")
     sid = create_document("service", service)
     return {"id": sid}
+
+
+@app.put("/services/{service_id}")
+def update_service(service_id: str, payload: ServiceUpdate, current=Depends(get_current_user)):
+    if current.get("role") not in ("admin", "doctor"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    try:
+        oid = ObjectId(service_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id")
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not updates:
+        return {"updated": 0}
+    updates["updated_at"] = datetime.now(timezone.utc)
+    res = db["service"].update_one({"_id": oid}, {"$set": updates})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"updated": res.modified_count}
+
+
+@app.delete("/services/{service_id}")
+def delete_service(service_id: str, current=Depends(get_current_user)):
+    if current.get("role") not in ("admin", "doctor"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    try:
+        oid = ObjectId(service_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id")
+    res = db["service"].delete_one({"_id": oid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"deleted": 1}
 
 
 # Doctors
@@ -231,6 +303,30 @@ def my_appointments(current=Depends(get_current_user)):
     return items
 
 
+@app.get("/appointments")
+def list_appointments(current=Depends(get_current_user)):
+    if current.get("role") not in ("admin", "doctor"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    items = get_documents("appointment")
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
+
+
+@app.put("/appointments/{appointment_id}/status")
+def update_appointment_status(appointment_id: str, payload: AppointmentStatusUpdate, current=Depends(get_current_user)):
+    if current.get("role") not in ("admin", "doctor"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    try:
+        oid = ObjectId(appointment_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id")
+    res = db["appointment"].update_one({"_id": oid}, {"$set": {"status": payload.status, "updated_at": datetime.now(timezone.utc)}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"updated": res.modified_count}
+
+
 # Messages (simple chat)
 @app.get("/messages/thread")
 def get_thread(user_id: str, doctor_id: str, current=Depends(get_current_user)):
@@ -278,8 +374,8 @@ def init_payment(payload: PaymentInit, current=Depends(get_current_user)):
         reference=f"PMT-{int(datetime.now().timestamp())}",
     )
     pid = create_document("payment", payment)
-    # In a real integration, return client secret / payment intent
-    return {"id": pid, "status": "initiated", "message": "Stripe integration placeholder"}
+    # Placeholder for Stripe Payment Intent, return a fake client secret for now
+    return {"id": pid, "status": "initiated", "client_secret": "test_client_secret"}
 
 
 if __name__ == "__main__":
