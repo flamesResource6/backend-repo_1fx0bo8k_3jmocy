@@ -1,8 +1,19 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException, Depends, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+import jwt
+from passlib.context import CryptContext
+
+from database import db, create_document, get_documents
+from schemas import User as UserSchema, Service as ServiceSchema, Doctor as DoctorSchema, Appointment as AppointmentSchema, Message as MessageSchema, Offer as OfferSchema, Payment as PaymentSchema
+
+# App setup
+app = FastAPI(title="DermaCare+ API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,17 +23,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+# Auth setup
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "43200"))  # 30 days
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+
+# Helpers
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+def create_token(sub: str, role: str) -> str:
+    payload = {
+        "sub": sub,
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
+        user = db["user"].find_one({"email": payload.get("sub")})
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user["_id"] = str(user["_id"])  # stringify id
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# Models for requests
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ServiceCreate(ServiceSchema):
+    pass
+
+
+class AppointmentCreate(BaseModel):
+    service_id: str
+    date: str  # YYYY-MM-DD
+    time: str  # HH:mm
+    mode: str = "in_clinic"
+    doctor_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class AppointmentStatusUpdate(BaseModel):
+    status: str
+
+
+class MessageCreate(BaseModel):
+    doctor_id: str
+    text: Optional[str] = None
+    image_url: Optional[str] = None
+    audio_url: Optional[str] = None
+
+
+# Routes
+@app.get("/")
+def root():
+    return {"name": "DermaCare+ API", "status": "ok"}
+
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -31,38 +113,173 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
+            response["database"] = "✅ Connected & Working"
+            response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+            response["database_name"] = db.name
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            response["collections"] = db.list_collection_names()
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+        response["database"] = f"❌ Error: {str(e)[:80]}"
     return response
+
+
+# Auth
+@app.post("/auth/register", response_model=TokenResponse)
+def register(payload: RegisterRequest):
+    if db["user"].find_one({"email": payload.email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = UserSchema(
+        email=payload.email,
+        password_hash=pwd_context.hash(payload.password),
+        name=payload.name,
+        phone=payload.phone,
+    )
+    create_document("user", user)
+    token = create_token(payload.email, role="user")
+    return TokenResponse(access_token=token)
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(payload: LoginRequest):
+    user = db["user"].find_one({"email": payload.email})
+    if not user or not pwd_context.verify(payload.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_token(payload.email, role=user.get("role", "user"))
+    return TokenResponse(access_token=token)
+
+
+@app.get("/me")
+def me(current=Depends(get_current_user)):
+    current.pop("password_hash", None)
+    return current
+
+
+# Services
+@app.get("/services")
+def list_services():
+    items = get_documents("service")
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
+
+
+@app.post("/services")
+def create_service(service: ServiceCreate, current=Depends(get_current_user)):
+    if current.get("role") not in ("admin", "doctor"):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    sid = create_document("service", service)
+    return {"id": sid}
+
+
+# Doctors
+@app.get("/doctors")
+def list_doctors():
+    items = get_documents("doctor")
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
+
+
+@app.post("/doctors")
+def create_doctor(doctor: DoctorSchema, current=Depends(get_current_user)):
+    if current.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    did = create_document("doctor", doctor)
+    return {"id": did}
+
+
+# Offers
+@app.get("/offers")
+def list_offers():
+    items = get_documents("offer")
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
+
+
+@app.post("/offers")
+def create_offer(offer: OfferSchema, current=Depends(get_current_user)):
+    if current.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    oid = create_document("offer", offer)
+    return {"id": oid}
+
+
+# Appointments
+@app.post("/appointments")
+def create_appointment(payload: AppointmentCreate, current=Depends(get_current_user)):
+    appt = AppointmentSchema(
+        user_id=str(current["_id"]),
+        doctor_id=payload.doctor_id,
+        service_id=payload.service_id,
+        date=payload.date,
+        time=payload.time,
+        mode=payload.mode,
+        notes=payload.notes,
+    )
+    aid = create_document("appointment", appt)
+    return {"id": aid, "status": "pending"}
+
+
+@app.get("/appointments/my")
+def my_appointments(current=Depends(get_current_user)):
+    items = get_documents("appointment", {"user_id": str(current["_id"])})
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return items
+
+
+# Messages (simple chat)
+@app.get("/messages/thread")
+def get_thread(user_id: str, doctor_id: str, current=Depends(get_current_user)):
+    # Allow user or doctor/admin to view
+    if current.get("role") == "user" and user_id != str(current["_id"]):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    items = get_documents("message", {"user_id": user_id, "doctor_id": doctor_id})
+    for it in items:
+        it["_id"] = str(it["_id"])
+    return sorted(items, key=lambda x: x.get("created_at", datetime.now()))
+
+
+@app.post("/messages")
+def send_message(payload: MessageCreate, current=Depends(get_current_user)):
+    sender = "user" if current.get("role") == "user" else "doctor"
+    msg = MessageSchema(
+        user_id=str(current["_id"]) if sender == "user" else "",
+        doctor_id=payload.doctor_id,
+        sender=sender,
+        text=payload.text,
+        image_url=payload.image_url,
+        audio_url=payload.audio_url,
+        created_at=datetime.now(timezone.utc),
+    )
+    mid = create_document("message", msg)
+    return {"id": mid}
+
+
+# Payments (placeholder initiation)
+class PaymentInit(BaseModel):
+    appointment_id: str
+    amount: float
+    currency: str = "USD"
+
+
+@app.post("/payments/init")
+def init_payment(payload: PaymentInit, current=Depends(get_current_user)):
+    payment = PaymentSchema(
+        user_id=str(current["_id"]),
+        appointment_id=payload.appointment_id,
+        amount=payload.amount,
+        currency=payload.currency,
+        provider="stripe",
+        status="initiated",
+        reference=f"PMT-{int(datetime.now().timestamp())}",
+    )
+    pid = create_document("payment", payment)
+    # In a real integration, return client secret / payment intent
+    return {"id": pid, "status": "initiated", "message": "Stripe integration placeholder"}
 
 
 if __name__ == "__main__":

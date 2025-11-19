@@ -1,48 +1,87 @@
 """
-Database Schemas
+Database Schemas for DermaCare+
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
+Each Pydantic model corresponds to a MongoDB collection.
+Collection name = lowercase of the class name (handled by caller).
 
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+We keep fields focused and pragmatic so the MVP works end-to-end.
 """
 
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional, List
+from datetime import datetime
 
-# Example schemas (replace with your own):
 
 class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
-    name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+    email: EmailStr
+    password_hash: str = Field(..., description="Hashed password")
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    gender: Optional[str] = Field(None, description="male | female | other")
+    age: Optional[int] = Field(None, ge=0, le=120)
+    photo_url: Optional[str] = None
+    preferred_doctor_id: Optional[str] = None
+    health_notes: Optional[str] = None
+    loyalty_points: int = 0
+    role: str = Field("user", description="user | doctor | admin")
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
 
-# Add your own schemas here:
-# --------------------------------------------------
+class Doctor(BaseModel):
+    name: str
+    specialty: str
+    photo_url: Optional[str] = None
+    bio: Optional[str] = None
+    rating: float = 5.0
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+
+class Service(BaseModel):
+    name: str
+    category: str
+    description: Optional[str] = None
+    duration_minutes: int = 30
+    price: float = 0.0
+    before_after_images: Optional[List[str]] = None
+    video_url: Optional[str] = None
+    featured: bool = False
+
+
+class Appointment(BaseModel):
+    user_id: str
+    doctor_id: Optional[str] = None
+    service_id: str
+    date: str  # ISO date string (YYYY-MM-DD)
+    time: str  # HH:mm
+    mode: str = Field("in_clinic", description="in_clinic | online")
+    status: str = Field("pending", description="pending | approved | rejected | completed | cancelled")
+    payment_status: str = Field("unpaid", description="unpaid | paid | refunded")
+    notes: Optional[str] = None
+
+
+class Message(BaseModel):
+    user_id: str
+    doctor_id: str
+    sender: str = Field(..., description="user | doctor")
+    text: Optional[str] = None
+    image_url: Optional[str] = None
+    audio_url: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class Offer(BaseModel):
+    title: str
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    promo_code: Optional[str] = None
+    discount_percent: Optional[int] = Field(None, ge=1, le=100)
+
+
+class Payment(BaseModel):
+    user_id: str
+    appointment_id: Optional[str] = None
+    amount: float
+    currency: str = "USD"
+    provider: str = Field("stripe", description="stripe | apple_pay | google_pay | wallet")
+    status: str = Field("initiated", description="initiated | succeeded | failed | refunded")
+    reference: Optional[str] = None
