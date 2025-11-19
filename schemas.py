@@ -81,7 +81,7 @@ class Payment(BaseModel):
     user_id: str
     appointment_id: Optional[str] = None
     amount: float
-    currency: str = "USD"
+    currency: str = "SAR"
     provider: str = Field("stripe", description="stripe | apple_pay | google_pay | wallet")
     status: str = Field("initiated", description="initiated | succeeded | failed | refunded")
     reference: Optional[str] = None

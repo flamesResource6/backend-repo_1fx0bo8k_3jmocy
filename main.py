@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -23,7 +23,7 @@ from schemas import (
 )
 
 # App setup
-app = FastAPI(title="DermaCare+ API", version="0.2.1")
+app = FastAPI(title="DermaCare+ API", version="0.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +38,18 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "43200"))  # 30 days
+
+# Payments (Stripe)
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET")
+STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE")
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "SAR")
+
+try:
+    import stripe
+    if STRIPE_SECRET_KEY:
+        stripe.api_key = STRIPE_SECRET_KEY
+except Exception:
+    stripe = None
 
 
 # Helpers
@@ -168,6 +180,7 @@ def register(payload: RegisterRequest):
 
 
 @app.post("/auth/login", response_model=TokenResponse)
+
 def login(payload: LoginRequest):
     user = db["user"].find_one({"email": payload.email})
     if not user or not pwd_context.verify(payload.password, user.get("password_hash", "")):
@@ -177,6 +190,7 @@ def login(payload: LoginRequest):
 
 
 @app.get("/me")
+
 def me(current=Depends(get_current_user)):
     current.pop("password_hash", None)
     return current
@@ -184,6 +198,7 @@ def me(current=Depends(get_current_user)):
 
 # Notification tokens
 @app.post("/notifications/token")
+
 def save_notification_token(payload: NotificationTokenCreate, current=Depends(get_current_user)):
     doc = NotificationTokenSchema(
         user_id=str(current["_id"]),
@@ -198,6 +213,7 @@ def save_notification_token(payload: NotificationTokenCreate, current=Depends(ge
 
 # Services
 @app.get("/services")
+
 def list_services():
     items = get_documents("service")
     for it in items:
@@ -206,6 +222,7 @@ def list_services():
 
 
 @app.post("/services")
+
 def create_service(service: ServiceCreate, current=Depends(get_current_user)):
     if current.get("role") not in ("admin", "doctor"):
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -214,6 +231,7 @@ def create_service(service: ServiceCreate, current=Depends(get_current_user)):
 
 
 @app.put("/services/{service_id}")
+
 def update_service(service_id: str, payload: ServiceUpdate, current=Depends(get_current_user)):
     if current.get("role") not in ("admin", "doctor"):
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -232,6 +250,7 @@ def update_service(service_id: str, payload: ServiceUpdate, current=Depends(get_
 
 
 @app.delete("/services/{service_id}")
+
 def delete_service(service_id: str, current=Depends(get_current_user)):
     if current.get("role") not in ("admin", "doctor"):
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -247,6 +266,7 @@ def delete_service(service_id: str, current=Depends(get_current_user)):
 
 # Doctors
 @app.get("/doctors")
+
 def list_doctors():
     items = get_documents("doctor")
     for it in items:
@@ -255,6 +275,7 @@ def list_doctors():
 
 
 @app.post("/doctors")
+
 def create_doctor(doctor: DoctorSchema, current=Depends(get_current_user)):
     if current.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -264,6 +285,7 @@ def create_doctor(doctor: DoctorSchema, current=Depends(get_current_user)):
 
 # Offers
 @app.get("/offers")
+
 def list_offers():
     items = get_documents("offer")
     for it in items:
@@ -272,6 +294,7 @@ def list_offers():
 
 
 @app.post("/offers")
+
 def create_offer(offer: OfferSchema, current=Depends(get_current_user)):
     if current.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -281,6 +304,7 @@ def create_offer(offer: OfferSchema, current=Depends(get_current_user)):
 
 # Appointments
 @app.post("/appointments")
+
 def create_appointment(payload: AppointmentCreate, current=Depends(get_current_user)):
     appt = AppointmentSchema(
         user_id=str(current["_id"]),
@@ -296,6 +320,7 @@ def create_appointment(payload: AppointmentCreate, current=Depends(get_current_u
 
 
 @app.get("/appointments/my")
+
 def my_appointments(current=Depends(get_current_user)):
     items = get_documents("appointment", {"user_id": str(current["_id"])})
     for it in items:
@@ -304,6 +329,7 @@ def my_appointments(current=Depends(get_current_user)):
 
 
 @app.get("/appointments")
+
 def list_appointments(current=Depends(get_current_user)):
     if current.get("role") not in ("admin", "doctor"):
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -314,6 +340,7 @@ def list_appointments(current=Depends(get_current_user)):
 
 
 @app.put("/appointments/{appointment_id}/status")
+
 def update_appointment_status(appointment_id: str, payload: AppointmentStatusUpdate, current=Depends(get_current_user)):
     if current.get("role") not in ("admin", "doctor"):
         raise HTTPException(status_code=403, detail="Not authorized")
@@ -329,6 +356,7 @@ def update_appointment_status(appointment_id: str, payload: AppointmentStatusUpd
 
 # Messages (simple chat)
 @app.get("/messages/thread")
+
 def get_thread(user_id: str, doctor_id: str, current=Depends(get_current_user)):
     # Allow user or doctor/admin to view
     if current.get("role") == "user" and user_id != str(current["_id"]):
@@ -340,6 +368,7 @@ def get_thread(user_id: str, doctor_id: str, current=Depends(get_current_user)):
 
 
 @app.post("/messages")
+
 def send_message(payload: MessageCreate, current=Depends(get_current_user)):
     sender = "user" if current.get("role") == "user" else "doctor"
     msg = MessageSchema(
@@ -355,27 +384,101 @@ def send_message(payload: MessageCreate, current=Depends(get_current_user)):
     return {"id": mid}
 
 
-# Payments (placeholder initiation)
+# Payments
 class PaymentInit(BaseModel):
     appointment_id: str
     amount: float
-    currency: str = "USD"
+    currency: str | None = None
 
 
 @app.post("/payments/init")
+
 def init_payment(payload: PaymentInit, current=Depends(get_current_user)):
+    currency = payload.currency or DEFAULT_CURRENCY
     payment = PaymentSchema(
         user_id=str(current["_id"]),
         appointment_id=payload.appointment_id,
         amount=payload.amount,
-        currency=payload.currency,
+        currency=currency,
         provider="stripe",
         status="initiated",
         reference=f"PMT-{int(datetime.now().timestamp())}",
     )
     pid = create_document("payment", payment)
-    # Placeholder for Stripe Payment Intent, return a fake client secret for now
-    return {"id": pid, "status": "initiated", "client_secret": "test_client_secret"}
+
+    client_secret = "test_client_secret"
+    if stripe and STRIPE_SECRET_KEY:
+        try:
+            intent = stripe.PaymentIntent.create(
+                amount=int(round(payload.amount * 100)),
+                currency=currency.lower(),
+                metadata={
+                    "appointment_id": payload.appointment_id,
+                    "user_id": str(current["_id"]),
+                    "payment_id": pid,
+                },
+                automatic_payment_methods={"enabled": True},
+            )
+            client_secret = intent.get("client_secret")
+        except Exception:
+            client_secret = "test_client_secret"
+    return {"id": pid, "status": "initiated", "client_secret": client_secret}
+
+
+# Webhook endpoint (Stripe)
+class StripeEvent(BaseModel):
+    id: Optional[str] = None
+    type: Optional[str] = None
+    data: Optional[dict] = None
+
+
+@app.post("/payments/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    event = None
+    if stripe and webhook_secret:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload, sig_header=sig_header, secret=webhook_secret
+            )
+        except Exception:
+            return {"received": False}
+    else:
+        # In dev without real webhook secret, accept payload
+        try:
+            import json
+            event = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return {"received": False}
+
+    # Normalize event data
+    if isinstance(event, dict):
+        event_type = event.get("type")
+        data_obj = (event.get("data") or {}).get("object", {})
+    else:
+        event_type = getattr(event, "type", None)
+        data = getattr(event, "data", None)
+        data_obj = getattr(data, "object", {}) if data else {}
+
+    payment_id = None
+    metadata = data_obj.get("metadata") or {}
+    payment_id = metadata.get("payment_id")
+
+    if event_type in ("payment_intent.succeeded", "charge.succeeded") and payment_id:
+        try:
+            db["payment"].update_one({"_id": ObjectId(payment_id)}, {"$set": {"status": "succeeded", "updated_at": datetime.now(timezone.utc)}})
+        except Exception:
+            pass
+    elif event_type in ("payment_intent.payment_failed", "charge.failed") and payment_id:
+        try:
+            db["payment"].update_one({"_id": ObjectId(payment_id)}, {"$set": {"status": "failed", "updated_at": datetime.now(timezone.utc)}})
+        except Exception:
+            pass
+
+    return {"received": True}
 
 
 if __name__ == "__main__":
